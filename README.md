@@ -2,7 +2,8 @@
 
 A lightweight always-on-top desktop widget that displays real-time **CPU and GPU temperatures** and load percentages. Designed to be game-friendly — uses GDI+ rendering (no DirectX/Vulkan hooks), so it won't conflict with any game overlays.
 
-![Widget Preview](docs/preview.png)
+<img width="235" height="120" alt="image" src="https://github.com/user-attachments/assets/85a63ac2-98ca-4c75-8dc8-246d4e33cc8b" />
+
 
 ## Features
 
