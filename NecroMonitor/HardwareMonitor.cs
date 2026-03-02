@@ -75,7 +75,7 @@ public sealed class HardwareMonitor : IDisposable
 
             // Keep trying to resolve CPU temp sensor until we have a working source
             _resolveAttempts++;
-            if (!_sensorsResolved || (_cpuTempSensor?.Value == null && !_useWmiFallback))
+            if (!_sensorsResolved || (!HasValidTemperature(_cpuTempSensor?.Value) && !_useWmiFallback))
                 ResolveSensors();
 
             // Read cached sensors
@@ -84,15 +84,18 @@ public sealed class HardwareMonitor : IDisposable
             else
                 CpuTemp = _cpuTempSensor?.Value;
 
+            if (!HasValidTemperature(CpuTemp))
+                CpuTemp = null;
+
             GpuTemp = _gpuTempSensor?.Value;
             CpuLoad = _cpuLoadSensor?.Value ?? CpuLoad;
             GpuLoad = _gpuLoadSensor?.Value ?? GpuLoad;
 
-            // If CPU temp is still null after a couple of cycles, try WMI immediately
-            if (!_useWmiFallback && CpuTemp == null && _resolveAttempts >= 2)
+            // If CPU temp is still invalid after a couple of cycles, try WMI immediately
+            if (!_useWmiFallback && !HasValidTemperature(CpuTemp) && _resolveAttempts >= 2)
             {
                 var wmiTemp = ReadWmiCpuTemp();
-                if (wmiTemp != null)
+                if (HasValidTemperature(wmiTemp))
                 {
                     _useWmiFallback = true;
                     CpuTempSource = "WMI (ACPI Thermal Zone)";
@@ -121,7 +124,7 @@ public sealed class HardwareMonitor : IDisposable
 
         // 2) If CPU temp sensor is null or has no value, search motherboard/superIO
         //    Laptop ECs often report "CPU" or "CPU Core" temperature
-        if (_cpuTempSensor?.Value == null)
+        if (!HasValidTemperature(_cpuTempSensor?.Value))
         {
             foreach (var hardware in _computer.Hardware)
             {
@@ -141,7 +144,7 @@ public sealed class HardwareMonitor : IDisposable
         }
         else
         {
-            CpuTempSource = $"CPU ({_cpuTempSensor.Name})";
+            CpuTempSource = $"CPU ({_cpuTempSensor!.Name})";
         }
 
         // ── GPU sensors ──
@@ -158,7 +161,8 @@ public sealed class HardwareMonitor : IDisposable
             }
         }
 
-        _sensorsResolved = (_cpuTempSensor?.Value != null || _useWmiFallback)
+        _sensorsResolved = HasValidTemperature(_cpuTempSensor?.Value)
+                || _useWmiFallback
                         || _gpuTempSensor != null;
     }
 
@@ -203,6 +207,14 @@ public sealed class HardwareMonitor : IDisposable
     {
         var allSensors = GetAllSensors(hw, type);
 
+        static bool IsValidValue(ISensor sensor)
+        {
+            if (!sensor.Value.HasValue) return false;
+            if (sensor.SensorType == SensorType.Temperature)
+                return HasValidTemperature(sensor.Value);
+            return sensor.Value.Value > 0;
+        }
+
         // 1) Try preferred names in order, preferring sensors with a value
         foreach (var name in preferredNames)
         {
@@ -212,7 +224,7 @@ public sealed class HardwareMonitor : IDisposable
             foreach (var s in allSensors)
             {
                 if (!s.Name.Contains(name, StringComparison.OrdinalIgnoreCase)) continue;
-                if (s.Value.HasValue && s.Value.Value > 0)
+                if (IsValidValue(s))
                     withValue ??= s;
                 else
                     withoutValue ??= s;
@@ -224,10 +236,15 @@ public sealed class HardwareMonitor : IDisposable
 
         // 2) Any sensor of this type with a non-null value > 0
         foreach (var s in allSensors)
-            if (s.Value is > 0) return s;
+            if (IsValidValue(s)) return s;
 
         // 3) Any sensor of this type at all (value may come on next update)
         return allSensors.FirstOrDefault();
+    }
+
+    private static bool HasValidTemperature(float? value)
+    {
+        return value is > 0 and < 150;
     }
 
     private static List<ISensor> GetAllSensors(IHardware hw, SensorType type)
