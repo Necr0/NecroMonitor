@@ -1,4 +1,5 @@
 using System.Management;
+using System.Text;
 using LibreHardwareMonitor.Hardware;
 
 namespace NecroMonitor;
@@ -67,11 +68,7 @@ public sealed class HardwareMonitor : IDisposable
         {
             // Always update all hardware first
             foreach (var hardware in _computer.Hardware)
-            {
-                hardware.Update();
-                foreach (var sub in hardware.SubHardware)
-                    sub.Update();
-            }
+                UpdateHardwareTree(hardware);
 
             // Keep trying to resolve CPU temp sensor until we have a working source
             _resolveAttempts++;
@@ -94,12 +91,12 @@ public sealed class HardwareMonitor : IDisposable
             // If CPU temp is still invalid after a couple of cycles, try WMI immediately
             if (!_useWmiFallback && !HasValidTemperature(CpuTemp) && _resolveAttempts >= 2)
             {
-                var wmiTemp = ReadWmiCpuTemp();
-                if (HasValidTemperature(wmiTemp))
+                var fallbackTemp = ReadFallbackCpuTemp();
+                if (HasValidTemperature(fallbackTemp))
                 {
                     _useWmiFallback = true;
-                    CpuTempSource = "WMI (ACPI Thermal Zone)";
-                    CpuTemp = wmiTemp;
+                    CpuTempSource = "Windows Thermal Zone";
+                    CpuTemp = fallbackTemp;
                 }
             }
         }
@@ -109,20 +106,18 @@ public sealed class HardwareMonitor : IDisposable
     private void ResolveSensors()
     {
         // ── CPU sensors ──
-        // 1) Try the CPU hardware directly
+        // 1) Try CPU package/cores sensors first (Intel + AMD Ryzen)
         foreach (var hardware in _computer.Hardware)
         {
             if (hardware.HardwareType == HardwareType.Cpu)
             {
-                _cpuTempSensor ??= FindBestSensor(hardware, SensorType.Temperature,
-                    "Package", "Tctl", "Tdie", "CCD", "Core Max", "Core Average",
-                    "P-Core", "E-Core", "Core");
+                _cpuTempSensor = FindBestCpuTemperatureSensor(hardware, _cpuTempSensor);
                 _cpuLoadSensor ??= FindBestSensor(hardware, SensorType.Load,
                     "Total", "CPU Total");
             }
         }
 
-        // 2) If CPU temp sensor is null or has no value, search motherboard/superIO
+        // 2) If CPU temp is still invalid, search motherboard/superIO/EC hierarchy
         //    Laptop ECs often report "CPU" or "CPU Core" temperature
         if (!HasValidTemperature(_cpuTempSensor?.Value))
         {
@@ -134,10 +129,11 @@ public sealed class HardwareMonitor : IDisposable
                     var mbSensor = FindBestSensor(hardware, SensorType.Temperature,
                         "CPU", "CPU Core", "CPU Package", "CPU Temp", "Processor",
                         "System", "Temperature #1", "CPUTIN", "PECI");
-                    if (mbSensor != null)
+                    if (mbSensor != null && HasValidTemperature(mbSensor.Value))
                     {
                         _cpuTempSensor = mbSensor;
                         CpuTempSource = $"Motherboard ({mbSensor.Name})";
+                        break;
                     }
                 }
             }
@@ -168,7 +164,6 @@ public sealed class HardwareMonitor : IDisposable
 
     /// <summary>
     /// WMI fallback: reads CPU temperature from the ACPI thermal zone.
-    /// Works on most systems even when LibreHardwareMonitor's MSR approach fails.
     /// Returns Celsius, or null if not available.
     /// </summary>
     private static float? ReadWmiCpuTemp()
@@ -190,6 +185,95 @@ public sealed class HardwareMonitor : IDisposable
             }
 
             return maxTemp > 0 ? maxTemp : null;
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private static float? ReadFallbackCpuTemp()
+    {
+        var wmiAcpi = ReadWmiCpuTemp();
+        if (HasValidTemperature(wmiAcpi)) return wmiAcpi;
+
+        var perfFormatted = ReadPerfThermalZoneFormatted();
+        if (HasValidTemperature(perfFormatted)) return perfFormatted;
+
+        var perfRaw = ReadPerfThermalZoneRaw();
+        if (HasValidTemperature(perfRaw)) return perfRaw;
+
+        return null;
+    }
+
+    private static float? ReadPerfThermalZoneFormatted()
+    {
+        try
+        {
+            using var searcher = new ManagementObjectSearcher(
+                @"root\CIMV2",
+                "SELECT Name, Temperature, HighPrecisionTemperature FROM Win32_PerfFormattedData_Counters_ThermalZoneInformation");
+
+            float maxTemp = 0;
+            foreach (var obj in searcher.Get())
+            {
+                var temp = TryReadCelsius(obj, "HighPrecisionTemperature")
+                        ?? TryReadCelsius(obj, "Temperature");
+                if (temp is > 0 and < 150)
+                    maxTemp = Math.Max(maxTemp, temp.Value);
+            }
+
+            return maxTemp > 0 ? maxTemp : null;
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private static float? ReadPerfThermalZoneRaw()
+    {
+        try
+        {
+            using var searcher = new ManagementObjectSearcher(
+                @"root\CIMV2",
+                "SELECT Name, Temperature, HighPrecisionTemperature FROM Win32_PerfRawData_Counters_ThermalZoneInformation");
+
+            float maxTemp = 0;
+            foreach (var obj in searcher.Get())
+            {
+                var temp = TryReadCelsius(obj, "HighPrecisionTemperature")
+                        ?? TryReadCelsius(obj, "Temperature");
+                if (temp is > 0 and < 150)
+                    maxTemp = Math.Max(maxTemp, temp.Value);
+            }
+
+            return maxTemp > 0 ? maxTemp : null;
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private static float? TryReadCelsius(ManagementBaseObject obj, string propertyName)
+    {
+        try
+        {
+            if (obj[propertyName] == null) return null;
+
+            var raw = Convert.ToSingle(obj[propertyName]);
+            if (raw <= 0) return null;
+
+            // Common encodings from thermal zone providers:
+            //  - tenths of Kelvin (e.g. 3002 => 27.05C)
+            //  - Kelvin (e.g. 300 => 26.85C)
+            //  - Celsius already (e.g. 52)
+            if (raw > 1000f) return (raw / 10f) - 273.15f;
+            if (raw > 200f) return raw - 273.15f;
+            if (raw is > 0 and < 150) return raw;
+
+            return null;
         }
         catch
         {
@@ -219,27 +303,61 @@ public sealed class HardwareMonitor : IDisposable
         foreach (var name in preferredNames)
         {
             ISensor? withValue = null;
-            ISensor? withoutValue = null;
 
             foreach (var s in allSensors)
             {
                 if (!s.Name.Contains(name, StringComparison.OrdinalIgnoreCase)) continue;
                 if (IsValidValue(s))
                     withValue ??= s;
-                else
-                    withoutValue ??= s;
             }
 
             if (withValue != null) return withValue;
-            if (withoutValue != null) return withoutValue;
         }
 
         // 2) Any sensor of this type with a non-null value > 0
         foreach (var s in allSensors)
             if (IsValidValue(s)) return s;
 
-        // 3) Any sensor of this type at all (value may come on next update)
-        return allSensors.FirstOrDefault();
+        // 3) For non-temperature sensors, return first matching sensor as fallback
+        if (type != SensorType.Temperature)
+            return allSensors.FirstOrDefault();
+
+        // Temperature: no valid reading found
+        return null;
+    }
+
+    private static ISensor? FindBestCpuTemperatureSensor(IHardware cpuHardware, ISensor? current)
+    {
+        if (current != null && HasValidTemperature(current.Value))
+            return current;
+
+        var preferred = FindBestSensor(cpuHardware, SensorType.Temperature,
+            "Package", "CPU Package", "Tctl", "Tdie", "CCD", "Core Max", "Core Average",
+            "P-Core", "E-Core", "Core");
+        if (preferred != null)
+            return preferred;
+
+        var anyValidCpuTemp = GetAllSensors(cpuHardware, SensorType.Temperature)
+            .FirstOrDefault(s => HasValidTemperature(s.Value));
+        return anyValidCpuTemp;
+    }
+
+    private static void UpdateHardwareTree(IHardware hardware)
+    {
+        hardware.Update();
+        foreach (var sub in hardware.SubHardware)
+            UpdateHardwareTree(sub);
+    }
+
+    private static void AppendHardwareTree(StringBuilder sb, IHardware hardware, string indent)
+    {
+        hardware.Update();
+        sb.AppendLine($"{indent}Hardware: {hardware.Name} [{hardware.HardwareType}]");
+        foreach (var s in hardware.Sensors)
+            sb.AppendLine($"{indent}  Sensor: {s.Name} [{s.SensorType}] = {s.Value}");
+
+        foreach (var sub in hardware.SubHardware)
+            AppendHardwareTree(sb, sub, indent + "  ");
     }
 
     private static bool HasValidTemperature(float? value)
@@ -250,12 +368,17 @@ public sealed class HardwareMonitor : IDisposable
     private static List<ISensor> GetAllSensors(IHardware hw, SensorType type)
     {
         var list = new List<ISensor>();
+        CollectSensorsRecursive(hw, type, list);
+        return list;
+    }
+
+    private static void CollectSensorsRecursive(IHardware hw, SensorType type, List<ISensor> list)
+    {
         foreach (var s in hw.Sensors)
             if (s.SensorType == type) list.Add(s);
+
         foreach (var sub in hw.SubHardware)
-            foreach (var s in sub.Sensors)
-                if (s.SensorType == type) list.Add(s);
-        return list;
+            CollectSensorsRecursive(sub, type, list);
     }
 
     /// <summary>
@@ -263,7 +386,7 @@ public sealed class HardwareMonitor : IDisposable
     /// </summary>
     public string DumpSensors()
     {
-        var sb = new System.Text.StringBuilder();
+        var sb = new StringBuilder();
         sb.AppendLine($"=== NecroMonitor Sensor Dump ({DateTime.Now:yyyy-MM-dd HH:mm:ss}) ===");
         sb.AppendLine($"IsAvailable: {IsAvailable}");
         sb.AppendLine($"Resolved: {_sensorsResolved}, Attempts: {_resolveAttempts}");
@@ -272,25 +395,19 @@ public sealed class HardwareMonitor : IDisposable
         sb.AppendLine($"GPU Sensor: {_gpuTempSensor?.Name ?? "(none)"} = {_gpuTempSensor?.Value}");
         sb.AppendLine($"WMI Fallback: {_useWmiFallback}");
 
-        // Try WMI read for diagnostics
+        // Try thermal zone fallbacks for diagnostics
         var wmiTemp = ReadWmiCpuTemp();
+        var perfFormatted = ReadPerfThermalZoneFormatted();
+        var perfRaw = ReadPerfThermalZoneRaw();
+        var fallback = ReadFallbackCpuTemp();
         sb.AppendLine($"WMI Temp (ACPI): {wmiTemp}°C");
+        sb.AppendLine($"Perf Temp (Formatted): {perfFormatted}°C");
+        sb.AppendLine($"Perf Temp (Raw): {perfRaw}°C");
+        sb.AppendLine($"Fallback Temp: {fallback}°C");
         sb.AppendLine();
 
         foreach (var hw in _computer.Hardware)
-        {
-            hw.Update();
-            sb.AppendLine($"Hardware: {hw.Name} [{hw.HardwareType}]");
-            foreach (var s in hw.Sensors)
-                sb.AppendLine($"  Sensor: {s.Name} [{s.SensorType}] = {s.Value}");
-            foreach (var sub in hw.SubHardware)
-            {
-                sub.Update();
-                sb.AppendLine($"  SubHardware: {sub.Name} [{sub.HardwareType}]");
-                foreach (var s in sub.Sensors)
-                    sb.AppendLine($"    Sensor: {s.Name} [{s.SensorType}] = {s.Value}");
-            }
-        }
+            AppendHardwareTree(sb, hw, string.Empty);
 
         return sb.ToString();
     }
