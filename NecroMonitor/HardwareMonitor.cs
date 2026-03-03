@@ -117,24 +117,25 @@ public sealed class HardwareMonitor : IDisposable
             }
         }
 
-        // 2) If CPU temp is still invalid, search motherboard/superIO/EC hierarchy
-        //    Laptop ECs often report "CPU" or "CPU Core" temperature
+        // 2) If CPU temp is still invalid, search non-CPU/non-GPU hardware trees.
+        //    Some laptops expose EC/SuperIO temps outside the Motherboard node.
         if (!HasValidTemperature(_cpuTempSensor?.Value))
         {
             foreach (var hardware in _computer.Hardware)
             {
-                if (hardware.HardwareType == HardwareType.Motherboard)
+                if (!IsCandidateCpuTempHardware(hardware.HardwareType))
+                    continue;
+
+                // Sensors can exist on controller trees with various labels.
+                var boardSensor = FindBestSensor(hardware, SensorType.Temperature,
+                    "CPU", "CPU Core", "CPU Package", "CPU Temp", "Processor",
+                    "Tctl", "Tdie", "Package", "CPUTIN", "PECI", "Die", "SoC");
+
+                if (boardSensor != null && HasValidTemperature(boardSensor.Value))
                 {
-                    // Motherboard temps are usually on sub-hardware (SuperIO/EC chips)
-                    var mbSensor = FindBestSensor(hardware, SensorType.Temperature,
-                        "CPU", "CPU Core", "CPU Package", "CPU Temp", "Processor",
-                        "System", "Temperature #1", "CPUTIN", "PECI");
-                    if (mbSensor != null && HasValidTemperature(mbSensor.Value))
-                    {
-                        _cpuTempSensor = mbSensor;
-                        CpuTempSource = $"Motherboard ({mbSensor.Name})";
-                        break;
-                    }
+                    _cpuTempSensor = boardSensor;
+                    CpuTempSource = $"Board ({hardware.Name}: {boardSensor.Name})";
+                    break;
                 }
             }
         }
@@ -363,6 +364,14 @@ public sealed class HardwareMonitor : IDisposable
     private static bool HasValidTemperature(float? value)
     {
         return value is > 0 and < 150;
+    }
+
+    private static bool IsCandidateCpuTempHardware(HardwareType type)
+    {
+        return type is not HardwareType.Cpu
+            and not HardwareType.GpuNvidia
+            and not HardwareType.GpuAmd
+            and not HardwareType.GpuIntel;
     }
 
     private static List<ISensor> GetAllSensors(IHardware hw, SensorType type)
